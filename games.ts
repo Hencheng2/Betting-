@@ -1,5 +1,6 @@
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
+import { Id } from "./_generated/dataModel"; // Import Id type
 
 export const playSpinningGame = mutation({
   args: {
@@ -16,54 +17,72 @@ export const playSpinningGame = mutation({
       throw new Error("Insufficient balance");
     }
 
-    if (args.stake <= 0 || args.stake > user.balance) {
+    if (args.stake <= 0) { // Added check for non-positive stake
       throw new Error("Invalid stake amount");
     }
 
-    // Deduct stake from balance
-    const newBalance = user.balance - args.stake;
-    
+
+    // Deduct stake from balance BEFORE determining win/loss to reflect immediate cost
+    const balanceAfterStake = user.balance - args.stake;
+    await ctx.db.patch(args.userId, {
+        balance: balanceAfterStake,
+    });
+
     // 0.1% chance of winning (1 in 1000)
-    const isWin = Math.random() < 0.001;
-    
+    const isWin = Math.random() < 0.001; // This implements the 0.1% win chance
+
     let winAmount = 0;
     let multiplier = 0;
     let result: "win" | "loss" = "loss";
 
     if (isWin) {
-      // If win, multiply stake by 100x (to make it worthwhile for the low odds)
+      // If win, multiply stake by 100x
       multiplier = 100;
       winAmount = args.stake * multiplier;
       result = "win";
-      
+
       // Add winnings to balance
       await ctx.db.patch(args.userId, {
-        balance: newBalance + winAmount,
+        balance: balanceAfterStake + winAmount, // Add to the balance AFTER stake deduction
         totalWinnings: user.totalWinnings + winAmount,
       });
     } else {
-      // Just deduct the stake
-      await ctx.db.patch(args.userId, {
-        balance: newBalance,
-      });
+      // Balance was already deducted. No further balance change needed for loss.
     }
 
-    // Check if user has played after deposit (for withdrawal unlock)
-    if (user.hasDeposited && !user.hasPlayedAfterDeposit && args.stake <= 10) {
-      await ctx.db.patch(args.userId, {
-        hasPlayedAfterDeposit: true,
-        canWithdraw: true,
-      });
-    }
-
-    // Check if welcome bonus should be unlocked (300 KES total winnings)
+    // --- Withdrawal Condition Logic Update ---
+    // Fetch the user again to get the latest state after potential balance/winnings updates
     const updatedUser = await ctx.db.get(args.userId);
-    if (updatedUser && !updatedUser.welcomeBonusUnlocked && updatedUser.totalWinnings >= 300) {
+    if (!updatedUser) { // Should not happen if previous get() succeeded
+        throw new Error("Updated user state not found.");
+    }
+
+    let shouldBeAbleToWithdraw = updatedUser.canWithdraw; // Preserve existing canWithdraw state
+
+    // Condition 1: Welcome bonus unlocked by winning 300 KES
+    if (!updatedUser.welcomeBonusUnlocked && updatedUser.totalWinnings >= 300) {
       await ctx.db.patch(args.userId, {
         welcomeBonusUnlocked: true,
-        canWithdraw: true,
       });
+      shouldBeAbleToWithdraw = true;
     }
+
+    // Condition 2: Deposited 20 KES AND played a game with <= 10 KES stake
+    // This is ONLY checked if hasDeposited is true and hasPlayedAfterDeposit is false
+    if (updatedUser.hasDeposited && !updatedUser.hasPlayedAfterDeposit && args.stake <= 10) {
+      await ctx.db.patch(args.userId, {
+        hasPlayedAfterDeposit: true,
+      });
+      shouldBeAbleToWithdraw = true;
+    }
+
+    // Finally, update the canWithdraw flag if any condition is met
+    if (shouldBeAbleToWithdraw && !updatedUser.canWithdraw) {
+         await ctx.db.patch(args.userId, {
+            canWithdraw: true,
+         });
+    }
+
 
     // Record game transaction
     await ctx.db.insert("games", {
@@ -75,20 +94,21 @@ export const playSpinningGame = mutation({
       multiplier,
     });
 
-    // Record transaction
+    // Record main transaction (for dashboard history)
     await ctx.db.insert("transactions", {
       userId: args.userId,
       type: result === "win" ? "game_win" : "game_loss",
-      amount: result === "win" ? winAmount : -args.stake,
+      amount: result === "win" ? winAmount : -args.stake, // Positive for win, negative for loss
       status: "completed",
-      description: `Spinning game ${result}`,
+      description: `Spinning game (${result})`,
     });
+
 
     return {
       result,
       winAmount,
       multiplier,
-      newBalance: result === "win" ? newBalance + winAmount : newBalance,
+      newBalance: updatedUser.balance // Return the truly updated balance
     };
   },
 });
@@ -96,3 +116,10 @@ export const playSpinningGame = mutation({
 export const getUserGames = query({
   args: { userId: v.id("users") },
   handler: async (ctx, args) => {
+    return await ctx.db
+      .query("games")
+      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .order("desc") // Order by creation time, newest first
+      .take(50); // Limit to the last 50 games for performance
+  },
+});
